@@ -1,0 +1,23 @@
+{
+  "name": "@ipscope/sdk-node",
+  "version": "1.0.0",
+  "description": "Official, zero-dependency, type-safe Node.js server-side SDK for IPScope IP Intelligence lookups.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
