@@ -1,5 +1,5 @@
 /**
- * @fileoverview Public entrypoint for `@ipscope/sdk-node` — Official IPScope
+ * @fileoverview Public entrypoint for `@ipscope/sdk-node` - Official IPScope
  * Server-Side Node.js SDK for IP Intelligence lookups.
  */
 
