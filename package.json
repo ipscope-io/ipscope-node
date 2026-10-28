@@ -2,6 +2,12 @@
   "name": "@ipscope/sdk-node",
   "version": "1.0.0",
   "description": "Official, zero-dependency, type-safe Node.js server-side SDK for IPScope IP Intelligence lookups.",
+  "license": "MIT",
+  "homepage": "https://ipscope.io/docs/sdks/node",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ipscope-io/ipscope-node.git"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -12,10 +18,18 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
   },
   "engines": {
     "node": ">=18.0.0"
