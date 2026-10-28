@@ -8,6 +8,9 @@
     "type": "git",
     "url": "https://github.com/ipscope-io/ipscope-node.git"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
