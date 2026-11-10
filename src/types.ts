@@ -54,6 +54,12 @@ export interface GeoResponseBlock {
   readonly country_code: string | null;
   readonly subdivision?: string | null;
   readonly city: string | null;
+  /** Postal / ZIP code when available in the city dataset, or null. */
+  readonly postal_code?: string | null;
+  /** Representative latitude of the network's location (never device GPS), or null. */
+  readonly latitude?: number | null;
+  /** Representative longitude of the network's location (never device GPS), or null. */
+  readonly longitude?: number | null;
   readonly timezone?: string | null;
   readonly location_type: LocationType;
   readonly confidence: number;
@@ -79,6 +85,12 @@ export interface SecurityResponseBlock {
   readonly is_hosting: boolean | null;
   readonly is_tor_exit: boolean | null;
   readonly is_proxy: boolean | null;
+  /**
+   * True when the address is a published consumer privacy-relay egress (e.g. Apple
+   * iCloud Private Relay). Relay users are not reported as VPN, proxy or hosting.
+   * Absent or null when unknown.
+   */
+  readonly is_relay?: boolean | null;
   readonly anonymizer_type: AnonymizerType;
   readonly confidence: number;
   readonly reason_codes: readonly string[];
@@ -99,6 +111,11 @@ export interface ConnectionResponseBlock {
  * Optional security extensions block returned when licensed on the user's plan.
  */
 export interface SecurityExtensionsResponseBlock {
+  /**
+   * Abuse velocity score on a 0–100 scale (integer), or null when unknown.
+   * Typed as `number` so responses from older API builds that sent a 0.0–1.0
+   * fraction still parse.
+   */
   readonly abuse_velocity_score: number | null;
   readonly is_known_scanner: boolean | null;
   readonly observation_recency_hours: number | null;
@@ -131,6 +148,8 @@ export interface BatchLookupResponse {
 
 /**
  * Canonical network prefix record returned in `GET /v1/networks/:prefix/:length`.
+ *
+ * Unlike the lookup response, the snapshot record uses camelCase keys.
  */
 export interface CanonicalNetworkPrefixRecord {
   readonly prefix: string;
@@ -138,13 +157,28 @@ export interface CanonicalNetworkPrefixRecord {
   readonly asn: number | null;
   readonly organization: string | null;
   readonly countryCode?: string | null;
+  readonly subdivision?: string | null;
   readonly city?: string | null;
+  readonly postalCode?: string | null;
+  readonly latitude?: number | null;
+  readonly longitude?: number | null;
+  readonly timezone?: string | null;
   readonly locationType?: LocationType;
+  readonly geoConfidence?: number;
+  readonly accuracyRadiusKm?: number | null;
+  readonly isVirtualLocation?: boolean | null;
+  readonly connectionType?: ConnectionType;
   readonly isVpn?: boolean | null;
   readonly isHosting?: boolean | null;
   readonly isTorExit?: boolean | null;
   readonly isProxy?: boolean | null;
   readonly anonymizerType?: AnonymizerType;
+  readonly securityConfidence?: number;
+  /** Abuse velocity score (0–100), or null. */
+  readonly abuseVelocityScore?: number | null;
+  readonly isKnownScanner?: boolean | null;
+  readonly reasonCodes?: readonly string[];
+  readonly updatedAt?: string;
   readonly [key: string]: unknown;
 }
 
@@ -153,9 +187,15 @@ export interface CanonicalNetworkPrefixRecord {
  */
 export interface NetworkPrefixLookupResponse {
   readonly queried_cidr: string;
+  /** Most-specific prefix in the active snapshot that covers `queried_cidr`. */
+  readonly matched_network?: string;
   readonly family: IpFamily;
+  /** Prefix length of `matched_network` (e.g. `24`). */
+  readonly bgp_prefix_length?: number;
   readonly dataset_version: string;
   readonly record: CanonicalNetworkPrefixRecord | null;
+  /** Full IP lookup response for the prefix's base address. */
+  readonly lookup?: IpLookupResponse;
 }
 
 /**
@@ -182,7 +222,15 @@ export interface DatasetsMetadataResponse {
 /**
  * Submitter role for geolocation or anonymity correction feedback (`POST /v1/feedback`).
  */
-export type FeedbackRole = 'network_operator' | 'researcher' | 'end_user';
+export type FeedbackRole = 'network_owner' | 'user' | 'researcher';
+
+/**
+ * Role names shipped in 1.0.0 that the API never accepted.
+ * The client maps `network_operator` to `network_owner` and `end_user` to `user`.
+ *
+ * @deprecated Use {@link FeedbackRole} values instead.
+ */
+export type LegacyFeedbackRole = 'network_operator' | 'end_user';
 
 /**
  * Issue category for geolocation or anonymity correction feedback (`POST /v1/feedback`).
@@ -191,18 +239,39 @@ export type FeedbackIssueType =
   | 'wrong_country'
   | 'wrong_city'
   | 'false_positive_vpn'
-  | 'false_negative_vpn'
-  | 'wrong_asn'
+  | 'false_positive_hosting'
+  | 'false_positive_tor'
+  | 'virtual_location_mismatch'
   | 'other';
+
+/**
+ * Issue types shipped in 1.0.0 that the API never accepted. The client sends
+ * them as `other` and records the original value in
+ * `requested_correction.reported_issue_type`.
+ *
+ * @deprecated Use {@link FeedbackIssueType} values instead.
+ */
+export type LegacyFeedbackIssueType = 'false_negative_vpn' | 'wrong_asn';
 
 /**
  * Input payload for submitting IP/prefix correction feedback (`POST /v1/feedback`).
  */
 export interface FeedbackSubmissionInput {
   readonly prefix_or_ip: string;
-  readonly role: FeedbackRole;
-  readonly issue_type: FeedbackIssueType;
+  readonly role: FeedbackRole | LegacyFeedbackRole;
+  readonly issue_type: FeedbackIssueType | LegacyFeedbackIssueType;
   readonly requested_correction: Record<string, unknown>;
+  /** Public URL to geofeed / RDAP / traceroute evidence. */
+  readonly evidence_url?: string;
+  /** Whether you consent to follow-up contact (default: `false`). */
+  readonly contact_consent?: boolean;
+  /** Contact email for follow-up. */
+  readonly contact_email?: string;
+  /**
+   * @deprecated The API accepts a single `evidence_url`. The first URL is sent as
+   * `evidence_url`; when more than one is given, the full list is also sent as
+   * `requested_correction.evidence_urls`.
+   */
   readonly evidence_urls?: readonly string[];
 }
 
@@ -215,8 +284,13 @@ export interface FeedbackSubmissionResponse {
   readonly role: FeedbackRole;
   readonly issue_type: FeedbackIssueType;
   readonly requested_correction: Record<string, unknown>;
-  readonly evidence_urls?: readonly string[];
+  readonly evidence_url?: string;
+  readonly contact_consent?: boolean;
+  readonly contact_email?: string;
+  /** ISO-8601 submission timestamp (the API sends camelCase `createdAt`). */
   readonly createdAt: string;
+  /** Same value as `createdAt`; filled in by the SDK for snake_case consumers. */
+  readonly created_at?: string;
   readonly status: string;
 }
 
@@ -239,15 +313,20 @@ export interface ServiceStatusResponse {
 export interface RateLimitMetadata {
   /** Sustained rate limit per minute (`x-ratelimit-limit`). */
   readonly limitPerMinute: number | null;
-  /** Remaining tokens in the user's token bucket (`x-ratelimit-remaining`). */
+  /** Remaining requests in the current window (`x-ratelimit-remaining`). */
   readonly remaining: number | null;
-  /** UNIX epoch seconds when the bucket refills (`x-ratelimit-reset`). */
+  /** Seconds until the rate-limit window resets (`x-ratelimit-reset`). */
+  readonly resetAfterSeconds: number | null;
+  /**
+   * @deprecated Misnamed in 1.0.0: `x-ratelimit-reset` is a number of seconds
+   * until reset, not a UNIX epoch. Holds the same value as `resetAfterSeconds`.
+   */
   readonly resetEpochSeconds: number | null;
-  /** Rate-limit enforcement scope (`'user'`). */
+  /** Rate-limit enforcement scope (`x-ratelimit-scope`, e.g. `'user'`). */
   readonly scope: string | null;
-  /** Burst capacity (`x-ratelimit-burst`). */
+  /** @deprecated The API does not send `x-ratelimit-burst`; always `null`. */
   readonly burstCapacity: number | null;
-  /** Sustained requests-per-second rate (`x-ratelimit-rps`). */
+  /** @deprecated The API does not send `x-ratelimit-rps`; always `null`. */
   readonly rateLimitRps: number | null;
 }
 
@@ -305,7 +384,7 @@ export interface RetryOptions {
 export interface CacheOptions {
   /** Enable client-side in-memory LRU caching for IP & network lookups (default: `true`). */
   readonly enabled?: boolean;
-  /** Maximum number of entries in the LRU cache (default: `5000`). */
+  /** Maximum number of entries in the LRU cache (default: `512`). */
   readonly maxEntries?: number;
   /** Cache entry time-to-live in milliseconds (default: `60000` = 60s). */
   readonly ttlMs?: number;
@@ -316,7 +395,7 @@ export interface CacheOptions {
  */
 export interface IpScopeClientOptions {
   /**
-   * Your IPScope API key (e.g. `ips_live_...`).
+   * Your IPScope API key, in the form `<public>:<private>`.
    * Sent via `x-api-key` and `Authorization: Bearer <apiKey>`.
    */
   readonly apiKey: string;

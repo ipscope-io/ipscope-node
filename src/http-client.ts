@@ -29,10 +29,26 @@ const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_BASE_DELAY_MS = 150;
 const DEFAULT_MAX_DELAY_MS = 3000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MiB hard ceiling to protect Node.js heap
-const SDK_USER_AGENT = '@ipscope/sdk-node/1.0.0';
+/** SDK version, sent in the `User-Agent` header. */
+export const SDK_VERSION = '1.1.0';
+const SDK_USER_AGENT = `@ipscope/sdk-node/${SDK_VERSION}`;
+
+/** Rate-limit metadata with every field `null`, used before any response arrives. */
+export const EMPTY_RATE_LIMIT: RateLimitMetadata = Object.freeze({
+  limitPerMinute: null,
+  remaining: null,
+  resetAfterSeconds: null,
+  resetEpochSeconds: null,
+  scope: null,
+  burstCapacity: null,
+  rateLimitRps: null,
+});
 
 /**
- * Extracts user-scoped rate-limit headers returned by `@ipscope/api`.
+ * Extracts user-scoped rate-limit headers returned by `@ipscope/api`
+ * (`x-ratelimit-limit`, `-remaining`, `-reset`, `-scope`).
+ *
+ * `x-ratelimit-reset` is the number of seconds until the window resets.
  */
 export function parseRateLimitHeaders(headers: Headers): RateLimitMetadata {
   const parseHeaderInt = (name: string): number | null => {
@@ -42,13 +58,15 @@ export function parseRateLimitHeaders(headers: Headers): RateLimitMetadata {
     return Number.isFinite(parsed) ? parsed : null;
   };
 
+  const resetAfterSeconds = parseHeaderInt('x-ratelimit-reset');
   return {
     limitPerMinute: parseHeaderInt('x-ratelimit-limit'),
     remaining: parseHeaderInt('x-ratelimit-remaining'),
-    resetEpochSeconds: parseHeaderInt('x-ratelimit-reset'),
+    resetAfterSeconds,
+    resetEpochSeconds: resetAfterSeconds,
     scope: headers.get('x-ratelimit-scope'),
-    burstCapacity: parseHeaderInt('x-ratelimit-burst'),
-    rateLimitRps: parseHeaderInt('x-ratelimit-rps'),
+    burstCapacity: null,
+    rateLimitRps: null,
   };
 }
 
@@ -358,11 +376,9 @@ function computeRetryAfterMs(
       return Math.ceil(seconds * 1000);
     }
   }
-  if (rateLimit.resetEpochSeconds !== null) {
-    const deltaMs = rateLimit.resetEpochSeconds * 1000 - Date.now();
-    if (deltaMs > 0) {
-      return deltaMs;
-    }
+  // Fallback when Retry-After is absent: x-ratelimit-reset is seconds until reset.
+  if (rateLimit.resetAfterSeconds !== null && rateLimit.resetAfterSeconds > 0) {
+    return rateLimit.resetAfterSeconds * 1000;
   }
   return null;
 }

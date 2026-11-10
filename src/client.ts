@@ -14,11 +14,13 @@
 
 import { CacheStats, LruTtlCache } from './cache';
 import { IpScopeValidationError } from './errors';
-import { IpScopeHttpClient } from './http-client';
+import { EMPTY_RATE_LIMIT, IpScopeHttpClient } from './http-client';
 import {
   BatchChunkedOptions,
   BatchLookupResponse,
   DatasetsMetadataResponse,
+  FeedbackIssueType,
+  FeedbackRole,
   FeedbackSubmissionInput,
   FeedbackSubmissionResponse,
   IpLookupResponse,
@@ -99,14 +101,8 @@ export class IpScopeClient {
     const bypassCache = options?.bypassCache ?? false;
 
     let lastStatus = 200;
-    let lastRateLimit: RateLimitMetadata = this.http.getLastRateLimit() ?? {
-      limitPerMinute: null,
-      remaining: null,
-      resetEpochSeconds: null,
-      scope: null,
-      burstCapacity: null,
-      rateLimitRps: null,
-    };
+    let lastRateLimit: RateLimitMetadata =
+      this.http.getLastRateLimit() ?? EMPTY_RATE_LIMIT;
 
     const { value, fromCache } = await this.ipCache.getOrCompute(
       ip,
@@ -303,9 +299,13 @@ export class IpScopeClient {
    * Constant-RAM async generator (`for await (const batch of client.lookupBatchStream(ips))`)
    * for streaming very large IP lists (10,000+ IPs) in chunks of up to 100 IPs
    * without holding the entire output array in memory at once.
+   *
+   * Accepts any `Iterable<string>` (arrays, sets, generators) or
+   * `AsyncIterable<string>` (async generators, `readline` interfaces, streams).
+   * The next chunk is only read from the input after the previous batch is consumed.
    */
   async *lookupBatchStream(
-    rawIps: Iterable<string>,
+    rawIps: Iterable<string> | AsyncIterable<string>,
     options?: BatchChunkedOptions,
   ): AsyncGenerator<BatchLookupResponse, void, undefined> {
     const chunkSize = Math.min(
@@ -314,7 +314,7 @@ export class IpScopeClient {
     );
     let currentChunk: string[] = [];
 
-    for (const rawIp of rawIps) {
+    for await (const rawIp of rawIps) {
       const { ip } = validateIpAddress(rawIp);
       currentChunk.push(ip);
       if (currentChunk.length >= chunkSize) {
@@ -401,13 +401,23 @@ export class IpScopeClient {
     const res = await this.http.request<FeedbackSubmissionResponse>({
       method: 'POST',
       path: '/v1/feedback',
-      body: {
-        ...input,
-        prefix_or_ip: prefixOrIp,
-      },
+      body: buildFeedbackPayload(input, prefixOrIp),
       options,
     });
-    return res.data;
+    const data = res.data;
+    if (data && typeof data === 'object') {
+      const raw = data as unknown as Record<string, unknown>;
+      const createdAt =
+        typeof raw.createdAt === 'string'
+          ? raw.createdAt
+          : typeof raw.created_at === 'string'
+            ? raw.created_at
+            : undefined;
+      if (createdAt !== undefined) {
+        return { ...data, createdAt, created_at: createdAt };
+      }
+    }
+    return data;
   }
 
   /**
@@ -446,6 +456,62 @@ export class IpScopeClient {
     this.ipCache.clear();
     this.networkCache.clear();
   }
+}
+
+const LEGACY_FEEDBACK_ROLES: Readonly<Record<string, FeedbackRole>> = {
+  network_operator: 'network_owner',
+  end_user: 'user',
+};
+
+const LEGACY_FEEDBACK_ISSUE_TYPES = new Set(['false_negative_vpn', 'wrong_asn']);
+
+/**
+ * Builds the `POST /v1/feedback` body the API accepts, translating the 1.0.0
+ * role / issue-type names and the `evidence_urls` array.
+ */
+function buildFeedbackPayload(
+  input: FeedbackSubmissionInput,
+  prefixOrIp: string,
+): Record<string, unknown> {
+  const { evidence_urls: evidenceUrls, ...rest } = input;
+  const requestedCorrection: Record<string, unknown> = {
+    ...(input.requested_correction ?? {}),
+  };
+
+  const role = LEGACY_FEEDBACK_ROLES[input.role] ?? input.role;
+
+  let issueType: FeedbackIssueType;
+  if (LEGACY_FEEDBACK_ISSUE_TYPES.has(input.issue_type)) {
+    issueType = 'other';
+    if (requestedCorrection.reported_issue_type === undefined) {
+      requestedCorrection.reported_issue_type = input.issue_type;
+    }
+  } else {
+    issueType = input.issue_type as FeedbackIssueType;
+  }
+
+  let evidenceUrl = input.evidence_url;
+  if (evidenceUrls && evidenceUrls.length > 0) {
+    evidenceUrl ??= evidenceUrls[0];
+    if (
+      evidenceUrls.length > 1 &&
+      requestedCorrection.evidence_urls === undefined
+    ) {
+      requestedCorrection.evidence_urls = [...evidenceUrls];
+    }
+  }
+
+  const payload: Record<string, unknown> = {
+    ...rest,
+    prefix_or_ip: prefixOrIp,
+    role,
+    issue_type: issueType,
+    requested_correction: requestedCorrection,
+  };
+  if (evidenceUrl !== undefined) {
+    payload.evidence_url = evidenceUrl;
+  }
+  return payload;
 }
 
 /**

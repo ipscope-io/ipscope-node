@@ -83,10 +83,8 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
           'content-type': 'application/json',
           'x-ratelimit-limit': '1800',
           'x-ratelimit-remaining': '1799',
-          'x-ratelimit-reset': '1792920000',
+          'x-ratelimit-reset': '42',
           'x-ratelimit-scope': 'user',
-          'x-ratelimit-burst': '150',
-          'x-ratelimit-rps': '30',
         },
       });
     };
@@ -132,11 +130,104 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
     expect(rl).toEqual({
       limitPerMinute: 1800,
       remaining: 1799,
-      resetEpochSeconds: 1792920000,
+      resetAfterSeconds: 42,
+      resetEpochSeconds: 42,
       scope: 'user',
-      burstCapacity: 150,
-      rateLimitRps: 30,
+      burstCapacity: null,
+      rateLimitRps: null,
     });
+  });
+
+  it('parses latitude, longitude, postal_code, is_relay and an integer abuse_velocity_score', async () => {
+    const body = {
+      ...buildFixtureIpResponse('172.225.0.1'),
+      geo: {
+        country_code: 'TR',
+        city: 'Istanbul',
+        postal_code: '34000',
+        latitude: 41.0146,
+        longitude: 28.9532,
+        location_type: 'declared',
+        confidence: 0.84,
+      },
+      security: {
+        is_vpn: false,
+        is_hosting: false,
+        is_tor_exit: false,
+        is_proxy: false,
+        is_relay: true,
+        anonymizer_type: 'apple_private_relay',
+        confidence: 0.92,
+        reason_codes: ['PUBLISHED_PRIVACY_RELAY_EGRESS'],
+      },
+      security_extensions: {
+        abuse_velocity_score: 80,
+        is_known_scanner: false,
+        observation_recency_hours: 0,
+      },
+    };
+    const client = createIpScopeClient({
+      apiKey: 'pub:priv',
+      fetch: async () => new Response(JSON.stringify(body), { status: 200 }),
+    });
+    const res = await client.lookupIp('172.225.0.1');
+    expect(res.geo.latitude).toBe(41.0146);
+    expect(res.geo.longitude).toBe(28.9532);
+    expect(res.geo.postal_code).toBe('34000');
+    expect(res.security.is_relay).toBe(true);
+    expect(res.security_extensions?.abuse_velocity_score).toBe(80);
+  });
+
+  it('streams batches from Iterable and AsyncIterable inputs', async () => {
+    const sentBatches: string[][] = [];
+    const client = createIpScopeClient({
+      apiKey: 'pub:priv',
+      fetch: async (_input, init) => {
+        const { ips } = JSON.parse(String(init?.body)) as { ips: string[] };
+        sentBatches.push(ips);
+        return new Response(
+          JSON.stringify({
+            dataset_version: 'v1',
+            count: ips.length,
+            results: ips.map((ip) => buildFixtureIpResponse(ip)),
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    async function* asyncIps(): AsyncGenerator<string> {
+      for (let i = 1; i <= 5; i++) {
+        await new Promise((r) => setTimeout(r, 1));
+        yield `10.1.0.${i}`;
+      }
+    }
+
+    const fromAsync: string[] = [];
+    for await (const batch of client.lookupBatchStream(asyncIps(), { chunkSize: 2 })) {
+      fromAsync.push(...batch.results.map((r) => r.ip));
+    }
+    expect(fromAsync).toEqual(['10.1.0.1', '10.1.0.2', '10.1.0.3', '10.1.0.4', '10.1.0.5']);
+    expect(sentBatches.map((b) => b.length)).toEqual([2, 2, 1]);
+
+    client.clearCache();
+    sentBatches.length = 0;
+    const fromSync: string[] = [];
+    for await (const batch of client.lookupBatchStream(new Set(['10.2.0.1', '10.2.0.2', '10.2.0.3']))) {
+      fromSync.push(...batch.results.map((r) => r.ip));
+    }
+    expect(fromSync).toEqual(['10.2.0.1', '10.2.0.2', '10.2.0.3']);
+    expect(sentBatches).toHaveLength(1);
+
+    async function* badIps(): AsyncGenerator<string> {
+      yield 'not-an-ip';
+    }
+    const consume = async () => {
+      for await (const _batch of client.lookupBatchStream(badIps())) {
+        // unreachable
+      }
+    };
+    await expect(consume()).rejects.toThrow(IpScopeValidationError);
   });
 
   it('deduplicates batch IPs, reuses warm cache entries, and supports chunked batch lookups (>100 IPs)', async () => {
@@ -216,6 +307,7 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
   });
 
   it('supports network CIDR lookup, caller IP lookup, dataset metadata, feedback submission, and status', async () => {
+    const feedbackBodies: Record<string, unknown>[] = [];
     const mockFetch: typeof globalThis.fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith('/v1/ip/me')) {
@@ -227,14 +319,20 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
         return new Response(
           JSON.stringify({
             queried_cidr: '1.1.1.0/24',
+            matched_network: '1.1.1.0/24',
             family: 4,
+            bgp_prefix_length: 24,
             dataset_version: '2026-10-25T00:00:00Z.v1',
             record: {
               prefix: '1.1.1.0/24',
               family: 4,
               asn: 13335,
               organization: 'Cloudflare, Inc.',
+              countryCode: 'US',
+              latitude: 37.77,
+              abuseVelocityScore: 12,
             },
+            lookup: buildFixtureIpResponse('1.1.1.0'),
           }),
           { status: 200 },
         );
@@ -260,6 +358,7 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
       }
       if (url.endsWith('/v1/feedback') && init?.method === 'POST') {
         const body = JSON.parse(String(init.body));
+        feedbackBodies.push(body);
         return new Response(
           JSON.stringify({
             id: 'fb_test_123',
@@ -293,18 +392,65 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
     const netRes = await client.lookupNetwork('1.1.1.0/24');
     expect(netRes.queried_cidr).toBe('1.1.1.0/24');
     expect(netRes.record?.asn).toBe(13335);
+    expect(netRes.record?.countryCode).toBe('US');
+    expect(netRes.record?.latitude).toBe(37.77);
+    expect(netRes.record?.abuseVelocityScore).toBe(12);
+    expect(netRes.matched_network).toBe('1.1.1.0/24');
+    expect(netRes.bgp_prefix_length).toBe(24);
+    expect(netRes.lookup?.network.asn).toBe(13335);
 
     const ds = await client.getDatasetsMetadata();
     expect(ds.active_version).toBe('2026-10-25T00:00:00Z.v1');
 
     const fb = await client.submitFeedback({
       prefix_or_ip: '1.1.1.0/24',
-      role: 'network_operator',
-      issue_type: 'wrong_city',
+      role: 'network_owner',
+      issue_type: 'false_positive_hosting',
       requested_correction: { city: 'Los Angeles' },
+      evidence_url: 'https://example.com/geofeed.csv',
+      contact_consent: true,
+      contact_email: 'noc@example.com',
     });
     expect(fb.id).toBe('fb_test_123');
     expect(fb.status).toBe('pending_review');
+    expect(fb.createdAt).toBe('2026-10-25T00:00:00Z');
+    expect(fb.created_at).toBe('2026-10-25T00:00:00Z');
+    expect(feedbackBodies[0]).toEqual({
+      prefix_or_ip: '1.1.1.0/24',
+      role: 'network_owner',
+      issue_type: 'false_positive_hosting',
+      requested_correction: { city: 'Los Angeles' },
+      evidence_url: 'https://example.com/geofeed.csv',
+      contact_consent: true,
+      contact_email: 'noc@example.com',
+    });
+
+    // 1.0.0 names are translated to values the API accepts
+    await client.submitFeedback({
+      prefix_or_ip: '1.1.1.1',
+      role: 'network_operator',
+      issue_type: 'wrong_asn',
+      requested_correction: { asn: 13335 },
+      evidence_urls: ['https://example.com/a', 'https://example.com/b'],
+    });
+    expect(feedbackBodies[1]).toEqual({
+      prefix_or_ip: '1.1.1.1',
+      role: 'network_owner',
+      issue_type: 'other',
+      requested_correction: {
+        asn: 13335,
+        reported_issue_type: 'wrong_asn',
+        evidence_urls: ['https://example.com/a', 'https://example.com/b'],
+      },
+      evidence_url: 'https://example.com/a',
+    });
+    await client.submitFeedback({
+      prefix_or_ip: '1.1.1.1',
+      role: 'end_user',
+      issue_type: 'wrong_country',
+      requested_correction: {},
+    });
+    expect(feedbackBodies[2]?.role).toBe('user');
 
     const status = await client.getStatus();
     expect(status.status).toBe('healthy');
@@ -369,6 +515,44 @@ describe('@ipscope/sdk-node (Official Node.js Server-Side SDK)', () => {
     await expect(rateLimitedClient.lookupIp('1.1.1.1')).rejects.toThrow(
       IpScopeRateLimitError,
     );
+
+    // Without Retry-After, the wait falls back to x-ratelimit-reset (seconds until reset)
+    const resetOnlyClient = createIpScopeClient({
+      apiKey: 'ips_live_rl_key',
+      retry: { maxRetries: 0 },
+      fetch: async () =>
+        new Response(JSON.stringify({ message: 'User rate limit exceeded' }), {
+          status: 429,
+          headers: { 'x-ratelimit-reset': '7', 'x-ratelimit-remaining': '0' },
+        }),
+    });
+    const rlErr = await resetOnlyClient.lookupIp('1.1.1.1').catch((e: unknown) => e);
+    expect(rlErr).toBeInstanceOf(IpScopeRateLimitError);
+    expect((rlErr as IpScopeRateLimitError).retryAfterMs).toBe(7000);
+    expect((rlErr as IpScopeRateLimitError).rateLimit?.resetAfterSeconds).toBe(7);
+
+    // ...and the automatic retry honours it (capped by maxDelayMs)
+    let resetAttempts = 0;
+    const resetRetryClient = createIpScopeClient({
+      apiKey: 'ips_live_rl_key',
+      retry: { maxRetries: 1, maxDelayMs: 30 },
+      fetch: async () => {
+        resetAttempts += 1;
+        if (resetAttempts === 1) {
+          return new Response('{}', {
+            status: 429,
+            headers: { 'x-ratelimit-reset': '1' },
+          });
+        }
+        return new Response(JSON.stringify(buildFixtureIpResponse('1.1.1.1')), {
+          status: 200,
+        });
+      },
+    });
+    const started = Date.now();
+    await resetRetryClient.lookupIp('1.1.1.1');
+    expect(resetAttempts).toBe(2);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(25);
 
     // Timeout throws IpScopeTimeoutError
     const slowClient = createIpScopeClient({
